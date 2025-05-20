@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Streamlit
+.streamlit/secrets.toml        # never push your secrets
