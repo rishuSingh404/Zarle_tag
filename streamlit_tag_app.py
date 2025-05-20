@@ -11,17 +11,17 @@ import openai
 import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
 from streamlit_option_menu import option_menu
+from openai import BadRequestError
 
 # ─── Settings ────────────────────────────────────────────────────────────────
-openai.api_key = os.getenv("OPENAI_API_KEY")               # or st.secrets["OPENAI_API_KEY"]
+openai.api_key = os.getenv("OPENAI_API_KEY")          # or st.secrets["OPENAI_API_KEY"]
 MODEL        = "text-embedding-3-small"
-BATCH        = 50                                         # question batch size
-DEFAULT_TAU  = 0.80                                        # similarity threshold
+BATCH        = 64                                     # ↓ smaller than before
+DEFAULT_TAU  = 0.80                                   # cosine-similarity threshold
 
 # ─── Page / Theme ────────────────────────────────────────────────────────────
 st.set_page_config("Zarle AI Automator", "🤖", "wide", initial_sidebar_state="expanded")
 
-# Global CSS (same as before) ────────────────────────────────────────────────
 st.markdown("""
 <style>
 .stApp { background-color:#121212; color:#EEE; }
@@ -66,12 +66,6 @@ with st.sidebar:
 TAG_SPLIT_RE  = re.compile(r"[,\|;/\n]+")
 PAIR_RE       = re.compile(r"\s*[:=]\s*")
 
-def _save_temp(uploaded, suffix: str) -> Path:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(uploaded.getvalue())
-    tmp.close()
-    return Path(tmp.name)
-
 def parse_tags(text: str) -> List[Dict[str, str]]:
     tokens = [t.strip() for t in TAG_SPLIT_RE.split(text) if t.strip()]
     tags   = []
@@ -85,9 +79,34 @@ def parse_tags(text: str) -> List[Dict[str, str]]:
 
 @st.cache_resource(show_spinner=False)
 def embed_texts(texts: List[str]) -> np.ndarray:
-    resp = openai.embeddings.create(input=texts, model=MODEL)
-    vecs = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
-    return vecs
+    """
+    Embed a list of texts safely:
+    • ensures every element is a non-empty string
+    • recursively splits oversize batches
+    """
+    # 1️⃣  sanitise: convert to str, replace empty with single space
+    cleaned = []
+    for t in texts:
+        if t is None:
+            cleaned.append(" ")
+        else:
+            s = str(t).strip()
+            cleaned.append(s if s else " ")
+
+    try:
+        resp = openai.embeddings.create(input=cleaned, model=MODEL)
+        vecs = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
+        return vecs
+
+    # 2️⃣  oversize batch → split & recur
+    except BadRequestError as e:
+        if "maximum context length" in str(e) and len(cleaned) > 1:
+            mid = len(cleaned) // 2
+            return np.vstack([
+                embed_texts(cleaned[:mid]),
+                embed_texts(cleaned[mid:])
+            ])
+        raise  # re-raise all other errors unchanged
 
 def choose_tags(
     q_vec: np.ndarray,
@@ -98,7 +117,7 @@ def choose_tags(
     """Return tags whose cosine-similarity ≥ τ; if none, return the best tag."""
     sims = cosine_similarity([q_vec], tag_vecs)[0]
     idxs = [i for i, s in enumerate(sims) if s >= threshold]
-    if not idxs:                                    # nothing met τ → keep best
+    if not idxs:                                   # nothing met τ → keep best
         idxs = [int(np.argmax(sims))]
     idxs.sort(key=lambda i: sims[i], reverse=True)
     return [tags[i]["title"] for i in idxs]
