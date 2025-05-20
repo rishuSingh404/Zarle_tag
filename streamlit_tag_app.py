@@ -16,7 +16,7 @@ from openai import BadRequestError
 # ─── Settings ────────────────────────────────────────────────────────────────
 openai.api_key = os.getenv("OPENAI_API_KEY")          # or st.secrets["OPENAI_API_KEY"]
 MODEL        = "text-embedding-3-small"
-BATCH        = 64                                     # ↓ smaller than before
+BATCH        = 64                                     # size per embedding call
 DEFAULT_TAU  = 0.80                                   # cosine-similarity threshold
 
 # ─── Page / Theme ────────────────────────────────────────────────────────────
@@ -67,6 +67,7 @@ TAG_SPLIT_RE  = re.compile(r"[,\|;/\n]+")
 PAIR_RE       = re.compile(r"\s*[:=]\s*")
 
 def parse_tags(text: str) -> List[Dict[str, str]]:
+    """Split multiline / delimited tag input into [{'title', 'description'}, …]."""
     tokens = [t.strip() for t in TAG_SPLIT_RE.split(text) if t.strip()]
     tags   = []
     for tok in tokens:
@@ -81,10 +82,9 @@ def parse_tags(text: str) -> List[Dict[str, str]]:
 def embed_texts(texts: List[str]) -> np.ndarray:
     """
     Embed a list of texts safely:
-    • ensures every element is a non-empty string
-    • recursively splits oversize batches
+    • converts non-strings and blank values to a single space
+    • recursively splits oversize batches caught by BadRequestError
     """
-    # 1️⃣  sanitise: convert to str, replace empty with single space
     cleaned = []
     for t in texts:
         if t is None:
@@ -98,7 +98,6 @@ def embed_texts(texts: List[str]) -> np.ndarray:
         vecs = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
         return vecs
 
-    # 2️⃣  oversize batch → split & recur
     except BadRequestError as e:
         if "maximum context length" in str(e) and len(cleaned) > 1:
             mid = len(cleaned) // 2
@@ -106,7 +105,7 @@ def embed_texts(texts: List[str]) -> np.ndarray:
                 embed_texts(cleaned[:mid]),
                 embed_texts(cleaned[mid:])
             ])
-        raise  # re-raise all other errors unchanged
+        raise
 
 def choose_tags(
     q_vec: np.ndarray,
@@ -114,11 +113,11 @@ def choose_tags(
     tags: List[Dict[str, str]],
     threshold: float
 ) -> List[str]:
-    """Return tags whose cosine-similarity ≥ τ; if none, return the best tag."""
+    """Return tag titles whose cosine similarity ≥ τ; guarantee at least one tag."""
     sims = cosine_similarity([q_vec], tag_vecs)[0]
     idxs = [i for i, s in enumerate(sims) if s >= threshold]
-    if not idxs:                                   # nothing met τ → keep best
-        idxs = [int(np.argmax(sims))]
+    if not idxs:
+        idxs = [int(np.argmax(sims))]          # ensure one tag
     idxs.sort(key=lambda i: sims[i], reverse=True)
     return [tags[i]["title"] for i in idxs]
 
@@ -129,7 +128,7 @@ if selected == "Tag Questions":
     q_file  = st.file_uploader("Upload questions JSON", type="json")
     tag_text = st.text_area(
         "Enter tag list (comma / ; / | / newline separated).\n"
-        "Optional description with `:` or `=` (e.g.  *Math = questions on mathematics*)",
+        "Optional description with `:` or `=` (e.g.  Math = mathematics questions)",
         height=160,
     )
 
@@ -177,11 +176,16 @@ if selected == "Tag Questions":
                 )
             progress.progress(min((i + BATCH) / len(q_texts), 1.0))
 
-        # 3️⃣  Attach tags & stream out file
+        # 3️⃣  Attach tags & write output file in text mode
         for q, tl in zip(questions, all_tag_lists):
             q["questionTags"] = tl
 
-        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix="_tagged.json")
+        tmp_out = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix="_tagged.json",
+            mode="w",            # text mode
+            encoding="utf-8"
+        )
         json.dump(questions, tmp_out, ensure_ascii=False, indent=2)
         tmp_out.close()
 
