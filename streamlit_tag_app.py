@@ -15,7 +15,7 @@ from streamlit_option_menu import option_menu
 # ─── Settings ────────────────────────────────────────────────────────────────
 openai.api_key = os.getenv("OPENAI_API_KEY")               # or st.secrets["OPENAI_API_KEY"]
 MODEL        = "text-embedding-3-small"
-BATCH        = 256                                         # question batch size
+BATCH        = 50                                         # question batch size
 DEFAULT_TAU  = 0.80                                        # similarity threshold
 
 # ─── Page / Theme ────────────────────────────────────────────────────────────
