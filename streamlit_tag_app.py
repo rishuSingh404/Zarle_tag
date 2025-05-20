@@ -1,10 +1,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# streamlit_tag_app.py
-# One-step JSON question-tagger (cosine-similarity threshold only)
+# streamlit_tag_app.py  – direction-aware version
 # ──────────────────────────────────────────────────────────────────────────────
 import json, os, re, tempfile
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Any
 
 import numpy as np
 import openai
@@ -16,12 +15,11 @@ from openai import BadRequestError
 # ─── Settings ────────────────────────────────────────────────────────────────
 openai.api_key = os.getenv("OPENAI_API_KEY")          # or st.secrets["OPENAI_API_KEY"]
 MODEL        = "text-embedding-3-small"
-BATCH        = 64                                     # size per embedding call
-DEFAULT_TAU  = 0.80                                   # cosine-similarity threshold
+BATCH        = 64
+DEFAULT_TAU  = 0.80
 
-# ─── Page / Theme ────────────────────────────────────────────────────────────
+# ─── Page / Theme (unchanged) ────────────────────────────────────────────────
 st.set_page_config("Zarle AI Automator", "🤖", "wide", initial_sidebar_state="expanded")
-
 st.markdown("""
 <style>
 .stApp { background-color:#121212; color:#EEE; }
@@ -36,7 +34,7 @@ button[kind="primary"]:hover{background-color:#BA68C8!important;transform:scale(
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Sidebar ────────────────────────────────────────────────────────────────
+# ─── Sidebar (unchanged) ─────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("""
     <div style="display:flex;flex-direction:column;align-items:center;height:200px">
@@ -62,12 +60,11 @@ with st.sidebar:
         },
     )
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
+# ─── Tag helpers (unchanged) ────────────────────────────────────────────────
 TAG_SPLIT_RE  = re.compile(r"[,\|;/\n]+")
 PAIR_RE       = re.compile(r"\s*[:=]\s*")
 
 def parse_tags(text: str) -> List[Dict[str, str]]:
-    """Split multiline / delimited tag input into [{'title', 'description'}, …]."""
     tokens = [t.strip() for t in TAG_SPLIT_RE.split(text) if t.strip()]
     tags   = []
     for tok in tokens:
@@ -78,13 +75,30 @@ def parse_tags(text: str) -> List[Dict[str, str]]:
         tags.append({"title": title.strip(), "description": desc.strip()})
     return tags
 
+# ─── NEW: flatten standalone + direction-based questions ────────────────────
+def flatten_questions(data: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Returns a list of dicts:
+      { 'obj': <reference to question dict>,
+        'text': <paragraph + question text for embedding> }
+    """
+    flat = []
+    for item in data:
+        # Direction/passage set
+        if isinstance(item, dict) and isinstance(item.get("questions"), list):
+            para = item.get("paragraph", "")
+            for sub in item["questions"]:
+                q_text = sub.get("question", "")
+                combined = f"{para}\n\n{q_text}" if para else q_text
+                flat.append({"obj": sub, "text": combined})
+        else:  # standalone
+            if isinstance(item, dict):
+                flat.append({"obj": item, "text": item.get("question", "")})
+    return flat
+
+# ─── Embedding helpers (unchanged safeguards) ───────────────────────────────
 @st.cache_resource(show_spinner=False)
 def embed_texts(texts: List[str]) -> np.ndarray:
-    """
-    Embed a list of texts safely:
-    • converts non-strings and blank values to a single space
-    • recursively splits oversize batches caught by BadRequestError
-    """
     cleaned = []
     for t in texts:
         if t is None:
@@ -92,36 +106,22 @@ def embed_texts(texts: List[str]) -> np.ndarray:
         else:
             s = str(t).strip()
             cleaned.append(s if s else " ")
-
     try:
         resp = openai.embeddings.create(input=cleaned, model=MODEL)
-        vecs = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
-        return vecs
-
+        return np.asarray([d.embedding for d in resp.data], dtype=np.float32)
     except BadRequestError as e:
         if "maximum context length" in str(e) and len(cleaned) > 1:
             mid = len(cleaned) // 2
-            return np.vstack([
-                embed_texts(cleaned[:mid]),
-                embed_texts(cleaned[mid:])
-            ])
+            return np.vstack([embed_texts(cleaned[:mid]), embed_texts(cleaned[mid:])])
         raise
 
-def choose_tags(
-    q_vec: np.ndarray,
-    tag_vecs: np.ndarray,
-    tags: List[Dict[str, str]],
-    threshold: float
-) -> List[str]:
-    """Return tag titles whose cosine similarity ≥ τ; guarantee at least one tag."""
+def choose_tags(q_vec, tag_vecs, tags, threshold):
     sims = cosine_similarity([q_vec], tag_vecs)[0]
-    idxs = [i for i, s in enumerate(sims) if s >= threshold]
-    if not idxs:
-        idxs = [int(np.argmax(sims))]          # ensure one tag
+    idxs = [i for i, s in enumerate(sims) if s >= threshold] or [int(np.argmax(sims))]
     idxs.sort(key=lambda i: sims[i], reverse=True)
     return [tags[i]["title"] for i in idxs]
 
-# ─── Main Interface ─────────────────────────────────────────────────────────
+# ─── Main interface ─────────────────────────────────────────────────────────
 if selected == "Tag Questions":
     st.header("🏷️  Tag Questions JSON")
 
@@ -132,66 +132,60 @@ if selected == "Tag Questions":
         height=160,
     )
 
-    threshold = st.slider(
-        "Cosine-similarity threshold (τ)",
-        0.00, 1.00, DEFAULT_TAU, 0.01
-    )
-
+    threshold = st.slider("Cosine-similarity threshold (τ)", 0.00, 1.00, DEFAULT_TAU, 0.01)
     run = st.button("Generate tagged JSON  ⏩", type="primary")
 
     if run:
+        # Preconditions
         if not openai.api_key:
-            st.error("❌  OpenAI API key not found. Please set `OPENAI_API_KEY`.")
+            st.error("❌  OPENAI_API_KEY not set.")
             st.stop()
         if not (q_file and tag_text.strip()):
-            st.warning("Please provide **both** the JSON file *and* at least one tag.")
+            st.warning("Please supply both a JSON file and at least one tag.")
             st.stop()
 
         tags = parse_tags(tag_text)
         st.success(f"Loaded {len(tags)} tags.")
 
+        # Load JSON
         try:
-            questions = json.load(q_file)
+            data = json.load(q_file)
         except Exception as e:
-            st.error(f"❌  Could not read JSON file: {e}")
+            st.error(f"Error reading JSON: {e}")
+            st.stop()
+        if not isinstance(data, list):
+            st.error("JSON root must be a list.")
             st.stop()
 
-        if not isinstance(questions, list):
-            st.error("❌  JSON root must be a list of question objects.")
+        # Flatten questions
+        flat = flatten_questions(data)
+        if not flat:
+            st.error("No question objects found in the JSON.")
             st.stop()
 
-        # 1️⃣  Embed tags once
+        # Embed tags once
         with st.spinner("Embedding tags…"):
             tag_vecs = embed_texts([t["description"] for t in tags])
 
-        # 2️⃣  Embed questions in batches & tag
-        q_texts = [q.get("question", "") for q in questions]
-        all_tag_lists = []
+        # Embed questions & tag
         progress = st.progress(0)
-        for i in range(0, len(q_texts), BATCH):
-            vecs = embed_texts(q_texts[i : i + BATCH])
-            for v in vecs:
-                all_tag_lists.append(
-                    choose_tags(v, tag_vecs, tags, threshold=threshold)
-                )
-            progress.progress(min((i + BATCH) / len(q_texts), 1.0))
+        for start in range(0, len(flat), BATCH):
+            texts_batch = [d["text"] for d in flat[start:start+BATCH]]
+            vecs = embed_texts(texts_batch)
+            for d, v in zip(flat[start:start+BATCH], vecs):
+                d["obj"]["questionTags"] = choose_tags(v, tag_vecs, tags, threshold)
+            progress.progress(min((start+BATCH)/len(flat), 1.0))
 
-        # 3️⃣  Attach tags & write output file in text mode
-        for q, tl in zip(questions, all_tag_lists):
-            q["questionTags"] = tl
-
+        # Write output
         tmp_out = tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix="_tagged.json",
-            mode="w",            # text mode
-            encoding="utf-8"
+            delete=False, suffix="_tagged.json", mode="w", encoding="utf-8"
         )
-        json.dump(questions, tmp_out, ensure_ascii=False, indent=2)
+        json.dump(data, tmp_out, ensure_ascii=False, indent=2)
         tmp_out.close()
 
         st.success("✅  Tagging complete!")
-        st.markdown("**Preview (first 3 questions):**")
-        st.json(questions[:3])
+        st.markdown("**Preview (first 3 questions found):**")
+        st.json([d["obj"] for d in flat[:3]])
 
         with open(tmp_out.name, "rb") as f:
             st.download_button(
