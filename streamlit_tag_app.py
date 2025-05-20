@@ -1,6 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # streamlit_tag_app.py
-# One-step JSON question-tagger with the same look-and-feel as Zarle AI Automator
+# One-step JSON question-tagger (cosine-similarity threshold only)
 # ──────────────────────────────────────────────────────────────────────────────
 import json, os, re, tempfile
 from pathlib import Path
@@ -16,24 +16,19 @@ from streamlit_option_menu import option_menu
 openai.api_key = os.getenv("OPENAI_API_KEY")               # or st.secrets["OPENAI_API_KEY"]
 MODEL        = "text-embedding-3-small"
 BATCH        = 256                                         # question batch size
-DEFAULT_DELTA = 0.05                                       # similarity window
+DEFAULT_TAU  = 0.80                                        # similarity threshold
 
 # ─── Page / Theme ────────────────────────────────────────────────────────────
 st.set_page_config("Zarle AI Automator", "🤖", "wide", initial_sidebar_state="expanded")
 
-# Global CSS (identical to your 5-step app) ───────────────────────────────────
+# Global CSS (same as before) ────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* dark background + typography */
 .stApp { background-color:#121212; color:#EEE; }
-/* sidebar */
 [data-testid="stSidebar"]{background-color:#1F1F1F;padding-top:1rem;}
-/* hide default header padding */
 header{visibility:hidden;} .block-container{padding-top:0rem;}
-/* file-uploader */
 .stFileUploader>label{width:100%;padding:1rem;background-color:#212121;
 border:2px dashed #444;border-radius:8px;color:#CCC;}
-/* primary buttons */
 button[kind="primary"]{background-color:#9C27B0!important;color:white!important;
 font-weight:bold;border:none;border-radius:8px;padding:0.6em 1.4em;
 transition:background-color .3s ease,transform .2s ease;}
@@ -41,7 +36,7 @@ button[kind="primary"]:hover{background-color:#BA68C8!important;transform:scale(
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Sidebar (logo + single menu item) ───────────────────────────────────────
+# ─── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("""
     <div style="display:flex;flex-direction:column;align-items:center;height:200px">
@@ -49,7 +44,7 @@ with st.sidebar:
     </div>
     <div style="color:white">
         <h3 style="margin-bottom:.2em">Zarle AI Automator</h3>
-        <p style="margin-top:0">Fast tagging of question JSON files with AI-generated embeddings.</p>
+        <p style="margin-top:0">Fast tagging of question JSON files with AI embeddings.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -72,14 +67,12 @@ TAG_SPLIT_RE  = re.compile(r"[,\|;/\n]+")
 PAIR_RE       = re.compile(r"\s*[:=]\s*")
 
 def _save_temp(uploaded, suffix: str) -> Path:
-    """Write uploaded file to a NamedTemporaryFile and return its Path."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(uploaded.getvalue())
     tmp.close()
     return Path(tmp.name)
 
 def parse_tags(text: str) -> List[Dict[str, str]]:
-    """Parse multiline / delimited tag input into [{'title':..,'description':..}, ...]"""
     tokens = [t.strip() for t in TAG_SPLIT_RE.split(text) if t.strip()]
     tags   = []
     for tok in tokens:
@@ -90,17 +83,23 @@ def parse_tags(text: str) -> List[Dict[str, str]]:
         tags.append({"title": title.strip(), "description": desc.strip()})
     return tags
 
-@st.cache_resource(show_spinner=False)  # reuse embeddings across runs
+@st.cache_resource(show_spinner=False)
 def embed_texts(texts: List[str]) -> np.ndarray:
-    """Embed a list of texts via OpenAI and return a 2-D numpy array."""
     resp = openai.embeddings.create(input=texts, model=MODEL)
     vecs = np.asarray([d.embedding for d in resp.data], dtype=np.float32)
     return vecs
 
-def choose_tags(q_vec: np.ndarray, tag_vecs: np.ndarray, tags: List[Dict[str, str]], delta: float) -> List[str]:
-    sims  = cosine_similarity([q_vec], tag_vecs)[0]
-    best  = sims.max()
-    idxs  = [i for i, s in enumerate(sims) if best - s <= delta] or [int(np.argmax(sims))]
+def choose_tags(
+    q_vec: np.ndarray,
+    tag_vecs: np.ndarray,
+    tags: List[Dict[str, str]],
+    threshold: float
+) -> List[str]:
+    """Return tags whose cosine-similarity ≥ τ; if none, return the best tag."""
+    sims = cosine_similarity([q_vec], tag_vecs)[0]
+    idxs = [i for i, s in enumerate(sims) if s >= threshold]
+    if not idxs:                                    # nothing met τ → keep best
+        idxs = [int(np.argmax(sims))]
     idxs.sort(key=lambda i: sims[i], reverse=True)
     return [tags[i]["title"] for i in idxs]
 
@@ -108,13 +107,18 @@ def choose_tags(q_vec: np.ndarray, tag_vecs: np.ndarray, tags: List[Dict[str, st
 if selected == "Tag Questions":
     st.header("🏷️  Tag Questions JSON")
 
-    q_file = st.file_uploader("Upload questions JSON", type="json")
+    q_file  = st.file_uploader("Upload questions JSON", type="json")
     tag_text = st.text_area(
         "Enter tag list (comma / ; / | / newline separated).\n"
         "Optional description with `:` or `=` (e.g.  *Math = questions on mathematics*)",
         height=160,
     )
-    delta = st.slider("Similarity window (Δ)", 0.0, 0.5, DEFAULT_DELTA, 0.01)
+
+    threshold = st.slider(
+        "Cosine-similarity threshold (τ)",
+        0.00, 1.00, DEFAULT_TAU, 0.01
+    )
+
     run = st.button("Generate tagged JSON  ⏩", type="primary")
 
     if run:
@@ -125,7 +129,6 @@ if selected == "Tag Questions":
             st.warning("Please provide **both** the JSON file *and* at least one tag.")
             st.stop()
 
-        # 1️⃣  Parse inputs
         tags = parse_tags(tag_text)
         st.success(f"Loaded {len(tags)} tags.")
 
@@ -139,21 +142,23 @@ if selected == "Tag Questions":
             st.error("❌  JSON root must be a list of question objects.")
             st.stop()
 
-        # 2️⃣  Embed tags once
+        # 1️⃣  Embed tags once
         with st.spinner("Embedding tags…"):
             tag_vecs = embed_texts([t["description"] for t in tags])
 
-        # 3️⃣  Embed questions in batches & tag
+        # 2️⃣  Embed questions in batches & tag
         q_texts = [q.get("question", "") for q in questions]
         all_tag_lists = []
         progress = st.progress(0)
         for i in range(0, len(q_texts), BATCH):
             vecs = embed_texts(q_texts[i : i + BATCH])
             for v in vecs:
-                all_tag_lists.append(choose_tags(v, tag_vecs, tags, delta))
+                all_tag_lists.append(
+                    choose_tags(v, tag_vecs, tags, threshold=threshold)
+                )
             progress.progress(min((i + BATCH) / len(q_texts), 1.0))
 
-        # 4️⃣  Attach tags & stream out file
+        # 3️⃣  Attach tags & stream out file
         for q, tl in zip(questions, all_tag_lists):
             q["questionTags"] = tl
 
