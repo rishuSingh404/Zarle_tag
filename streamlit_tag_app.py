@@ -16,7 +16,7 @@ from openai import BadRequestError
 openai.api_key = os.getenv("OPENAI_API_KEY")          # or st.secrets["OPENAI_API_KEY"]
 MODEL        = "text-embedding-3-small"
 BATCH        = 64
-DEFAULT_TAU  = 0.80
+DEFAULT_TAU  = 0.35
 
 # ─── Page / Theme (unchanged) ────────────────────────────────────────────────
 st.set_page_config("Zarle AI Automator", "🤖", "wide", initial_sidebar_state="expanded")
